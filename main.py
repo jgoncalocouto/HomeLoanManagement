@@ -364,6 +364,7 @@ def apply_scenario_dict(obj: dict):
     pending["upfront_csv_upl_key"]   = f"upfront_csv_{stamp}"
     pending["amort_csv_upl_key"]     = f"amort_csv_{stamp}"
     pending["inflation_csv_upl_key"] = f"inflation_csv_{stamp}"
+    pending["scen_json_upl_key"] = f"scen_json_upl_{stamp}"
 
     # Amortizações from scenario
     amdf = pd.DataFrame(obj.get("amortizations", []))
@@ -1060,85 +1061,96 @@ with st.sidebar:
     use_today = st.toggle("Usar data de hoje", value=True)
     ref_date = pd.Timestamp.today().date() if use_today else st.date_input("Data de referência", value=pd.Timestamp.today().date(), key="ref_date_manual")
 
-    st.header("📁 Cenários")
-    base_in = st.text_input("Diretório base", value=st.session_state["base_dir"])
-    if st.button("Usar esta pasta"):
-        st.session_state["base_dir"] = base_in
-        st.session_state["scen_dir"] = os.path.join(base_in, "scenarios")
-        os.makedirs(st.session_state["scen_dir"], exist_ok=True)
-        st.success(f"Pasta ativa: {st.session_state['scen_dir']}")
-        st.rerun()
-
-    try:
-        scen_files = [f for f in os.listdir(st.session_state["scen_dir"]) if f.endswith(".json")]
-    except Exception as e:
-        scen_files = []
-        st.error(f"Não foi possível listar a pasta: {e}")
-
-    scen_name = st.text_input("Nome do cenário", value="meu_cenario", key="scen_name")
-    if st.button("💾 Guardar cenário"):
-        # Use the cached current tables at save time
-        eur_df_for_save = st.session_state["eur_current_df"].copy()
-        up_for_save = st.session_state["upfront_current_df"].copy()
-        mo_for_save = st.session_state["monthly_current_df"].copy()
-        am_for_save = st.session_state["amort_current_df"].copy()
-
-        payload = {
-            "inputs": {
-                "rate_type": st.session_state["rate_type"],
-                "principal": st.session_state["principal"],
-                "years": st.session_state["years"],
-                "start": str(st.session_state["start"]),
-                "fixed_rate_pct": (st.session_state["fixed_rate_pct"] if st.session_state["rate_type"] == "Fixa" else None),
-                "spread_pct": (st.session_state["spread_pct"] if st.session_state["rate_type"] != "Fixa" else None),
-                "reset_months": (st.session_state["reset_months"] if st.session_state["rate_type"] != "Fixa" else None),
-            },
-            "euribor_forecast": (
-                eur_df_for_save.assign(date=pd.to_datetime(eur_df_for_save["date"]).dt.strftime("%Y-%m-%d")).to_dict(orient="records")
-                if st.session_state["rate_type"] != "Fixa" else []
-            ),
-            "fees_upfront": up_for_save.to_dict(orient="records"),
-            "fees_monthly": mo_for_save.to_dict(orient="records"),
-            
-            "stress": {
-                "income_anchors": st.session_state["income_current_df"].assign(date=pd.to_datetime(st.session_state["income_current_df"]["date"]).dt.strftime("%Y-%m-%d")
-                    ).to_dict(orient="records"),
-                    "income_growth": st.session_state["income_growth_current_df"].assign(
-                        date=pd.to_datetime(st.session_state["income_growth_current_df"]["date"]).dt.strftime("%Y-%m-%d")
-                    ).to_dict(orient="records"),
-                    "expenses_anchors": st.session_state["expenses_current_df"].assign(
-                        date=pd.to_datetime(st.session_state["expenses_current_df"]["date"]).dt.strftime("%Y-%m-%d")
-                    ).to_dict(orient="records"),
-                    "inflation": st.session_state["inflation_current_df"].assign(
-                        date=pd.to_datetime(st.session_state["inflation_current_df"]["date"]).dt.strftime("%Y-%m-%d")
-                    ).to_dict(orient="records"),
-                    "effort_threshold_pct": float(st.session_state["effort_threshold_pct"]),
-                },
-            "amortizations": am_for_save.assign(
-                date=pd.to_datetime(am_for_save["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-            ).replace({pd.NA: None}).to_dict(orient="records"),
-            "amort_strategy": st.session_state["amort_strategy"],
-            "amort_fee_pct": float(st.session_state["amort_fee_pct"]),
-        }
-        path = os.path.join(st.session_state["scen_dir"], f"{st.session_state['scen_name']}.json")
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            st.success(f"Guardado em {path}")
-        except Exception as e:
-            st.error(f"Falha ao guardar: {e}")
-
-    if scen_files:
-        pick = st.selectbox("Selecionar cenário da pasta", options=["—"] + sorted(scen_files), index=0, key="pick_scen")
-        if st.button("📥 Carregar cenário selecionado") and pick != "—":
-            try:
-                with open(os.path.join(st.session_state["scen_dir"], pick), "r", encoding="utf-8") as f:
-                    obj = json.load(f)
-                apply_scenario_dict(obj)  # staged load + rerun
-            except Exception as e:
-                st.error(f"Erro ao carregar {pick}: {e}")
-
+    # -----------------------------
+    # 📁 Cenários (cloud-friendly)
+    # -----------------------------
+    st.header("📁 Cenários (cloud-friendly)")
+    
+    # Ensure defaults for rotating uploader key and scenario name
+    st.session_state.setdefault("scen_json_upl_key", "scen_json_upl_0")
+    st.session_state.setdefault("scen_name", "meu_cenario")
+    
+    # --- Build payload (save current UI state to downloadable JSON)
+    eur_df_for_save = st.session_state["eur_current_df"].copy()
+    up_for_save     = st.session_state["upfront_current_df"].copy()
+    mo_for_save     = st.session_state["monthly_current_df"].copy()
+    am_for_save     = st.session_state["amort_current_df"].copy()
+    
+    payload = {
+        "inputs": {
+            "rate_type":       st.session_state["rate_type"],
+            "principal":       st.session_state["principal"],
+            "years":           st.session_state["years"],
+            "start":           str(st.session_state["start"]),
+            "fixed_rate_pct":  (st.session_state["fixed_rate_pct"] if st.session_state["rate_type"] == "Fixa" else None),
+            "spread_pct":      (st.session_state["spread_pct"] if st.session_state["rate_type"] != "Fixa" else None),
+            "reset_months":    (st.session_state["reset_months"] if st.session_state["rate_type"] != "Fixa" else None),
+        },
+        "euribor_forecast": (
+            eur_df_for_save.assign(
+                date=pd.to_datetime(eur_df_for_save["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            ).to_dict(orient="records")
+            if st.session_state["rate_type"] != "Fixa" else []
+        ),
+        "fees_upfront": up_for_save.to_dict(orient="records"),
+        "fees_monthly": mo_for_save.to_dict(orient="records"),
+        "stress": {
+            "income_anchors": st.session_state["income_current_df"].assign(
+                date=pd.to_datetime(st.session_state["income_current_df"]["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            ).to_dict(orient="records"),
+            "income_growth": st.session_state["income_growth_current_df"].assign(
+                date=pd.to_datetime(st.session_state["income_growth_current_df"]["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            ).to_dict(orient="records"),
+            "expenses_anchors": st.session_state["expenses_current_df"].assign(
+                date=pd.to_datetime(st.session_state["expenses_current_df"]["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            ).to_dict(orient="records"),
+            "inflation": st.session_state["inflation_current_df"].assign(
+                date=pd.to_datetime(st.session_state["inflation_current_df"]["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            ).to_dict(orient="records"),
+            "effort_threshold_pct": float(st.session_state["effort_threshold_pct"]),
+        },
+        "amortizations": am_for_save.assign(
+            date=pd.to_datetime(am_for_save["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        ).replace({pd.NA: None}).to_dict(orient="records"),
+        "amort_strategy": st.session_state["amort_strategy"],
+        "amort_fee_pct": float(st.session_state["amort_fee_pct"]),
+    }
+    
+    # --- Download current scenario as JSON
+    st.text_input("Nome do cenário (ficheiro)", key="scen_name")
+    st.download_button(
+        "💾 Descarregar cenário (.json)",
+        data=json.dumps(payload, ensure_ascii=False, indent=2),
+        file_name=f"{st.session_state['scen_name']}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+    st.caption("Sugestão: guarde o ficheiro .json no seu drive (GDrive/Dropbox/Git).")
+    
     st.divider()
+    
+    # --- Upload and apply a scenario JSON
+    scen_upl = st.file_uploader(
+        "📥 Carregar cenário (.json)",
+        type=["json"],
+        key=st.session_state["scen_json_upl_key"],   # rotating key prevents refresh loop
+        accept_multiple_files=False,
+    )
+    if scen_upl is not None:
+        try:
+            raw = scen_upl.read()
+            obj = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            st.error(f"Erro ao ler JSON: {e}")
+        else:
+            # IMPORTANT: apply_scenario_dict(obj) must rotate st.session_state['scen_json_upl_key']
+            # e.g., pending["scen_json_upl_key"] = f"scen_json_upl_{stamp}"
+            apply_scenario_dict(obj)   # stages values + st.rerun() internally
+            st.stop()                  # ensure we don't continue this run after scheduling rerun
+    
+    st.divider()
+    
+    # Keep your existing calculate button after the scenarios block
     calc_btn = st.button("✅ Calcular agora", use_container_width=True)
 
 # ========== Calculations (only when requested)
